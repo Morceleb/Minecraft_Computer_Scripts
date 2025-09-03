@@ -1,9 +1,12 @@
 local component = require("component")
 local term = require("term")
-local event = require("event")
-local inv = component.inventory_controller
 local reactor = component.proxy(component.list("reactor_chamber")())
+local inv = component.inventory_controller
+
+--初始化全局变量
 local reactorSide = 0
+local termWidth = 0
+
 
 -- 查找反应堆方向
 local function findreactor()
@@ -54,80 +57,63 @@ local function getHeatBar()
     local filled = math.ceil((currentHeat / maxHeat) * barLength)
     local empty = barLength - filled
     local bar = string.rep("█", filled) .. string.rep(" ", empty)
-    return string.format("\n堆温：[%s] (%d%%)", bar, heatPercent)
-end
-
--- 缓存上一次的物品状态
-local lastState = {}
-
--- 检查槽位是否发生变化
-local function hasChanged(slot, item)
-    local state = lastState[slot] or {}
-    local shortText, durabilityText = getShortNameAndDurability(item)
-    local changed = state.shortText ~= shortText or state.durabilityText ~= durabilityText
-    lastState[slot] = { shortText = shortText, durabilityText = durabilityText }
-    return changed
+    return string.format("堆温：[%s] (%d%%)", bar, heatPercent)
 end
 
 -- 获取终端宽度并计算居中所需的填充空格
 local function centerText(text, textWidth)
-    local termWidth = term.getViewport() -- 获取终端宽度
     local padding = math.ceil((termWidth - textWidth) / 2)
     if padding > 0 then
-        return string.rep(" ", padding) .. text
+        -- 在文本前填充空格（居中），在文本后填充空格以达到总长度
+        return string.rep(" ", padding) .. text .. string.rep(" ", termWidth - textWidth - padding)
     end
     return text
 end
 
-if findreactor() then
-    term.clear()
-    term.setCursor(1, 1)
-    print("已找到反应堆，开始监控...")
-
-    -- 主循环
-    while true do
-        local buffer = {}
-        local hasAnyChange = false
-        local stateLine = ""
-        for i = 0, 5, 1 do -- 6 行
-            local nameLine = ""
-            local durabilityLine = ""
-            for j = 1, 9, 1 do
-                local currentSlot = i * 9 + j
-                local currentItem = inv.getStackInSlot(reactorSide, currentSlot)
-                local shortText, durabilityText = getShortNameAndDurability(currentItem)
-                if hasChanged(currentSlot, currentItem) then
-                    hasAnyChange = true
-                end
-                nameLine = nameLine .. shortText
-                durabilityLine = durabilityLine .. durabilityText
-            end
-            table.insert(buffer, centerText(nameLine, 45) .. "\n")
-            table.insert(buffer, centerText(durabilityLine, 45) .. "\n")
-            if reactor.producesEnergy() then
-                stateLine = string.format("反应堆状态：开启，输出：%dEU/t", reactor.getReactorEUOutput()) .. getHeatBar()
-            else
-                stateLine = "反应堆状态：关闭，输出：0EU/t" .. getHeatBar()
-            end
+-- 更新屏幕显示
+local function updateDisplay()
+    local buffer = {}
+    local stateLine = ""
+    local heatLine = getHeatBar()
+    termWidth = term.getViewport()
+    for i = 0, 5, 1 do -- 6 行
+        local nameLine = ""
+        local durabilityLine = ""
+        for j = 1, 9, 1 do
+            local currentSlot = i * 9 + j
+            local currentItem = inv.getStackInSlot(reactorSide, currentSlot)
+            local shortText, durabilityText = getShortNameAndDurability(currentItem)
+            nameLine = nameLine .. shortText
+            durabilityLine = durabilityLine .. durabilityText
         end
-
-        -- 仅在有变化时更新屏幕
-        if hasAnyChange then
-            term.clear()
-            term.write(centerText("<[Q]  反应堆监视器  [E]>", 24) .. '\n')
-            term.write(table.concat(buffer))
-            term.write(stateLine)
-        end
-
-        -- 等待 0.1 秒或中断信号
-        local eventName = event.pull(0.1, "interrupted")
-        if eventName == "interrupted" then
-            term.clear()
-            term.setCursor(1, 1)
-            print(centerText("监控已停止", 10))
-            break
+        table.insert(buffer, centerText(nameLine, 45) .. "\n")
+        table.insert(buffer, centerText(durabilityLine, 45) .. "\n")
+        if reactor.producesEnergy() then
+            stateLine = string.format("反应堆状态：开启，输出：%dEU/t\n", reactor.getReactorEUOutput())
+        else
+            stateLine = "反应堆状态：关闭，输出：0EU/t\n"
         end
     end
-else
-    print(centerText("未找到反应堆！"))
+    term.setcursor(1, 1)
+    io.write(centerText("<[Q]  反应堆监视器  [E]>\n", 24))
+    io.write(table.concat(buffer))
+    io.write('\n')
+    io.write(centerText(stateLine, 45))
+    io.write(centerText(heatLine, 45))
 end
+
+--主程序
+local function main()
+    if findreactor() then
+        print("已找到反应堆，正在启动系统...")
+        term.clear()
+
+        while true do
+            updateDisplay() -- 每次循环直接更新屏幕
+        end
+    else
+        print(centerText("未找到反应堆！"))
+    end
+end
+
+main()
