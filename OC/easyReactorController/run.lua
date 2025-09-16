@@ -1,9 +1,19 @@
+-- 引入OC的API
 local component = require("component")
 local term = require("term")
 local thread = require("thread")
+local event = require("event")
+local keyboard = require("keyboard")
+
 local inv = component.inventory_controller
 local reactor = component.proxy(component.list("reactor_chamber")())
+
 local reactorSide = 0
+local totalPages = 2
+local currentPage = 1
+local gridThread = nil
+local statusThread = nil
+
 
 -- 查找反应堆方向
 local function findreactor()
@@ -92,22 +102,24 @@ local function getCenteredStartX(textWidth)
 end
 
 -- 更新反应堆网格的线程
+
+local lastGrid = {}
+local gridRows = 6
+local gridCols = 9
+
+for i = 1, gridRows do
+    lastGrid[i] = {}
+    for j = 1, gridCols do
+        lastGrid[i][j] = { shortText = "", durabilityText = "" }
+    end
+end
+
 local function updateGrid()
-    local gridRows = 6
-    local gridCols = 9
     local cellWidth = 5
     local cellHeight = 2
-    local gridWidth = gridCols * cellWidth
-    local startX = getCenteredStartX(gridWidth)
+    local startX = getCenteredStartX(45)
     local startY = 2
-    local lastGrid = {}
 
-    for i = 1, gridRows do
-        lastGrid[i] = {}
-        for j = 1, gridCols do
-            lastGrid[i][j] = { shortText = "", durabilityText = "" }
-        end
-    end
 
     while true do
         for i = 1, gridRows do
@@ -117,18 +129,17 @@ local function updateGrid()
                 local shortText, durabilityText = getShortNameAndDurability(currentItem)
                 local x = startX + (j - 1) * cellWidth
                 local y = startY + (i - 1) * cellHeight
-                if lastGrid[i][j].shortText ~= shortText then
+                if lastGrid[i][j].shortText ~= shortText or lastGrid[i][j].durabilityText ~= durabilityText then
                     term.setCursor(x, y)
                     term.write(shortText)
-                    lastGrid[i][j].shortText = shortText
-                end
-                if lastGrid[i][j].durabilityText ~= durabilityText then
                     term.setCursor(x, y + 1)
                     term.write(durabilityText)
+
+                    lastGrid[i][j].shortText = shortText
                     lastGrid[i][j].durabilityText = durabilityText
                 end
             end
-            os.sleep(0.05)
+            os.sleep(0.01)
         end
     end
 end
@@ -136,33 +147,125 @@ end
 -- 更新反应堆状态和热量条的线程
 local function updateStatus()
     while true do
-        local statusText = reactor.producesEnergy() and
-            string.format("反应堆状态：开启，输出：%5dEU/t", reactor.getReactorEUOutput()) or
-            "反应堆状态：关闭，输出：    0EU/t"
-        local heatBarText = getHeatBar()
-
-        -- 绘制状态和热量条（在网格下方）
-        term.setCursor(1, 15) -- 固定在第15行，避免与网格重叠
-        term.write(centerText(statusText, 45))
-        term.setCursor(1, 16)
-        term.write(centerText(heatBarText, 45))
-        os.sleep(0.01)
+        if currentPage == 1 then
+            local statusText = reactor.producesEnergy() and
+                string.format("反应堆状态：开启，输出：%5dEU/t", reactor.getReactorEUOutput()) or
+                "反应堆状态：关闭，输出：    0EU/t"
+            local heatBarText = getHeatBar()
+            -- 绘制状态和热量条（在网格下方）
+            term.setCursor(1, 15) -- 固定在第15行，避免与网格重叠
+            term.write(centerText(statusText, 45))
+            term.setCursor(1, 16)
+            term.write(centerText(heatBarText, 45))
+            os.sleep(0.01)
+        else
+            thread.current():suspend()
+        end
     end
 end
+
+-- 操作指南页面
+local function showGuide()
+    if currentPage == 2 then
+        local guideLines = {
+            "操作指南：",
+            "  A，D：切换页面",
+            "  CTRL+C： 退出程序",
+            "  （以下需要红石I/O）",
+            "  Q：关闭反应堆",
+            "  O：开启反应堆",
+            "图标解释：",
+            "  †：单铀燃料棒",
+            "  ⫲：双铀燃料棒",
+            "  ⌗：四铀燃料棒",
+            "  ⁜：元件散热片",
+            "  〿：散热片",
+            "  ◊：热交换器",
+        }
+        for i, line in ipairs(guideLines) do
+            term.setCursor(1, 2 + i)
+            term.write(centerText(line, 31))
+        end
+    end
+end
+
+
+-- 更新页面标题的线程
+local function updatePage()
+    local lastPage = 1
+    term.setCursor(1, 1)
+    term.write(centerText("<[A]  反应堆监视器  [D]>", 24))
+    while true do
+        if lastPage ~= currentPage then
+            lastPage = currentPage
+            term.clear()
+            term.setCursor(1, 1)
+            if currentPage == 1 then
+                term.write(centerText("<[A]  反应堆监视器  [D]>", 24))
+                if gridThread and gridThread:status() == "suspended" then
+                    gridThread:resume()
+                end
+                if statusThread and statusThread:status() == "suspended" then
+                    statusThread:resume()
+                end
+            elseif currentPage == 2 then
+                term.write(centerText("<[A]  操作指南  [D]>", 20))
+                if gridThread and gridThread:status() == "running" then
+                    gridThread:suspend()
+                    for i = 1, gridRows do
+                        lastGrid[i] = {}
+                        for j = 1, gridCols do
+                            lastGrid[i][j] = { shortText = "", durabilityText = "" }
+                        end
+                    end
+                end
+                if statusThread and statusThread:status() == "running" then
+                    statusThread:suspend()
+                end
+                showGuide()
+            elseif currentPage == 3 then
+                term.write(centerText("<[A]  系统设置  [D]>", 20))
+            end
+        end
+        os.sleep(0.05)
+    end
+end
+
+-- 监听键盘输入的线程
+local function listenForKeyPress()
+    while true do
+        local _, _, _, code = event.pull("key_down")
+        if code == keyboard.keys.a then -- A键
+            if currentPage > 1 then
+                currentPage = currentPage - 1
+            else
+                currentPage = totalPages
+            end
+        elseif code == keyboard.keys.d then -- D键
+            if currentPage < totalPages then
+                currentPage = currentPage + 1
+            else
+                currentPage = 1
+            end
+        end
+    end
+end
+
 
 -- 主程序
 if findreactor() then
     term.clear()
-    term.setCursor(1, 1)
-    term.write(centerText("<<<<  反应堆监视器  >>>>", 24))
 
-    -- 创建两个线程
-    local statusThread = thread.create(updateStatus)
+    local inputThread = thread.create(listenForKeyPress)
+    local pageThread = thread.create(updatePage)
 
-    local gridThread = thread.create(updateGrid)
+    statusThread = thread.create(updateStatus)
+    gridThread = thread.create(updateGrid)
+
+
 
     -- 等待线程结束（实际上不会结束，除非程序被中断）
-    thread.waitForAll({ gridThread, statusThread })
+    thread.waitForAll({ pageThread, statusThread, gridThread, inputThread })
 else
     print(centerText("未找到反应堆！"))
 end
