@@ -3,7 +3,6 @@ local component = require("component")
 local term = require("term")
 local thread = require("thread")
 local event = require("event")
-local keyboard = require("keyboard")
 
 local success, rs = pcall(function() return component.redstone end) --本来可以给物品栏控制器和反应堆都加上存在性判断的，但我不想写了
 
@@ -15,8 +14,7 @@ local redStoneSide = 0
 
 local totalPages = 2
 local currentPage = 1
-local gridThread = nil
-local statusThread = nil
+local monitorThread = nil
 
 -- 查找反应堆方向
 local function findreactor()
@@ -77,6 +75,8 @@ local function getShortNameAndDurability(item)
         shortText = "⌈ 〿 ⌉"
     elseif string.sub(name, -9) == "exchanger" then
         shortText = "⌈ ◊ ⌉"
+    elseif string.sub(name, -7) == "plating" then
+        shortText = "⌈ ■ ⌉"
     else
         local base = string.match(name, "^ic2:(.+)") or name
         local parts = {}
@@ -104,6 +104,16 @@ local function getShortNameAndDurability(item)
     return shortText, durabilityText
 end
 
+-- 获取终端宽度并计算居中所需的填充空格
+local function centerText(text, textWidth)
+    local termWidth = term.getViewport()
+    local padding = math.ceil((termWidth - textWidth) / 2)
+    if padding > 0 then
+        return string.rep(" ", padding) .. text .. string.rep(" ", termWidth - textWidth - padding - 1)
+    end
+    return text
+end
+
 -- 创建热量显示条
 local function getHeatBar()
     local maxHeat = 10000
@@ -116,24 +126,13 @@ local function getHeatBar()
     return string.format("堆温：[%s] (%d%%)", bar, heatPercent)
 end
 
--- 获取终端宽度并计算居中所需的填充空格
-local function centerText(text, textWidth)
-    local termWidth = term.getViewport()
-    local padding = math.ceil((termWidth - textWidth) / 2)
-    if padding > 0 then
-        return string.rep(" ", padding) .. text .. string.rep(" ", termWidth - textWidth - padding - 1)
-    end
-    return text
-end
-
 -- 获取终端宽度并计算居中所需的起始坐标
 local function getCenteredStartX(textWidth)
     local termWidth = term.getViewport()
     return math.ceil((termWidth - textWidth) / 2) + 1
 end
 
--- 更新反应堆网格的线程
-
+-- 更新反应堆监控器的线程
 local lastGrid = {}
 local gridRows = 6
 local gridCols = 9
@@ -145,12 +144,13 @@ for i = 1, gridRows do
     end
 end
 
-local function updateGrid()
+local function updateMonitor()
     local cellWidth = 5
     local cellHeight = 2
     local startX = getCenteredStartX(45)
     local startY = 2
 
+    local statusText = ""
 
     while true do
         for i = 1, gridRows do
@@ -170,27 +170,16 @@ local function updateGrid()
                     lastGrid[i][j].durabilityText = durabilityText
                 end
             end
-            os.sleep(0.01)
-        end
-    end
-end
-
--- 更新反应堆状态和热量条的线程
-local function updateStatus()
-    while true do
-        if currentPage == 1 then
-            local statusText = reactor.producesEnergy() and
+            -- 每行更新后刷新状态栏
+            statusText = reactor.producesEnergy() and
                 string.format("反应堆状态：开启，输出：%5dEU/t", reactor.getReactorEUOutput()) or
                 "反应堆状态：关闭，输出：    0EU/t"
             local heatBarText = getHeatBar()
-            -- 绘制状态和热量条（在网格下方）
             term.setCursor(1, 15) -- 固定在第15行，避免与网格重叠
             term.write(centerText(statusText, 45))
             term.setCursor(1, 16)
             term.write(centerText(heatBarText, 45))
             os.sleep(0.01)
-        else
-            thread.current():suspend()
         end
     end
 end
@@ -201,9 +190,8 @@ local function showGuide()
         local guideLines = {
             "操作指南：",
             "  A，D：切换页面",
-            "  CTRL+C：退出程序",
             "  Q：关闭反应堆",
-            "  O：开启反应堆",
+            "  S：开启反应堆",
             "图标解释：",
             "  †：单铀燃料棒",
             "  ⫲：双铀燃料棒",
@@ -211,6 +199,7 @@ local function showGuide()
             "  ⁜：元件散热片",
             "  〿：散热片",
             "  ◊：热交换器",
+            "  ■：反应堆隔板"
         }
         for i, line in ipairs(guideLines) do
             term.setCursor(1, 2 + i)
@@ -231,16 +220,13 @@ local function updatePage()
             term.setCursor(1, 1)
             if currentPage == 1 then
                 term.write(centerText("<[A]  反应堆监视器  [D]>", 24))
-                if gridThread and gridThread:status() == "suspended" then
-                    gridThread:resume()
-                end
-                if statusThread and statusThread:status() == "suspended" then
-                    statusThread:resume()
+                if monitorThread and monitorThread:status() == "suspended" then
+                    monitorThread:resume()
                 end
             elseif currentPage == 2 then
                 term.write(centerText("<[A]  操作指南  [D]>", 20))
-                if gridThread and gridThread:status() == "running" then
-                    gridThread:suspend()
+                if monitorThread and monitorThread:status() == "running" then
+                    monitorThread:suspend()
                     for i = 1, gridRows do
                         lastGrid[i] = {}
                         for j = 1, gridCols do
@@ -248,39 +234,37 @@ local function updatePage()
                         end
                     end
                 end
-                if statusThread and statusThread:status() == "running" then
-                    statusThread:suspend()
-                end
+
                 showGuide()
             elseif currentPage == 3 then
                 term.write(centerText("<[A]  系统设置  [D]>", 20))
             end
         end
-        os.sleep(0.05)
+        os.sleep(0.01)
     end
 end
 
 -- 监听键盘输入的线程
 local function listenForKeyPress()
     while true do
-        local _, _, _, code = event.pull("key_down")
-        if code == keyboard.keys.a then
+        local _, _, charCode = event.pull("key_down")
+        if charCode == 97 then
             if currentPage > 1 then
                 currentPage = currentPage - 1
             else
                 currentPage = totalPages
             end
-        elseif code == keyboard.keys.d then
+        elseif charCode == 100 then
             if currentPage < totalPages then
                 currentPage = currentPage + 1
             else
                 currentPage = 1
             end
-        elseif code == keyboard.keys.o then -- O键 开启反应堆
+        elseif charCode == 115 then -- s键 开启反应堆
             if not reactor.producesEnergy() then
                 rs.setOutput(redStoneSide, 15)
             end
-        elseif code == keyboard.keys.q then -- q键 中断反应堆
+        elseif charCode == 113 then -- q键 中断反应堆
             if reactor.producesEnergy() then
                 rs.setOutput(redStoneSide, 0)
             end
@@ -296,11 +280,10 @@ if findreactor() then
         local inputThread = thread.create(listenForKeyPress)
         local pageThread = thread.create(updatePage)
 
-        statusThread = thread.create(updateStatus)
-        gridThread = thread.create(updateGrid)
+        monitorThread = thread.create(updateMonitor)
 
         -- 等待线程结束（实际上不会结束，除非程序被中断）
-        thread.waitForAll({ pageThread, statusThread, gridThread, inputThread })
+        thread.waitForAll({ pageThread, monitorThread, inputThread })
     else
         print(centerText("红石I/O端口安装不当或存在其他红石输入", 37))
         os.sleep(5)
