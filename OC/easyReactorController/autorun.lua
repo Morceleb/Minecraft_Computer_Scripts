@@ -1,7 +1,6 @@
 -- 引入OC的API
 local component = require("component")
 local term = require("term")
-local thread = require("thread")
 local event = require("event")
 
 local success, rs = pcall(function() return component.redstone end) --本来可以给物品栏控制器和反应堆都加上存在性判断的，但我不想写了
@@ -14,8 +13,7 @@ local redStoneSide = 0
 
 local totalPages = 3
 local currentPage = 1
-local monitorThread = nil
-
+local monitor_active = true
 
 local currentHeat = 0    -- 当前热量
 local heatThreshold = 80 -- 默认热量阈值（百分比）
@@ -127,7 +125,7 @@ local function centerText(text, textWidth)
 end
 
 -- 自动化控制：高温关停和冷却后自动重启
-local function autoControl()
+local function autoControl_co()
     while true do
         currentHeat = reactor.getHeat()
         local currentHeatPercent = math.ceil((currentHeat / 10000) * 100)
@@ -154,7 +152,7 @@ local function autoControl()
             isCoolingDown = false
         end
 
-        os.sleep(0.02)
+        coroutine.yield()
     end
 end
 
@@ -174,7 +172,7 @@ local function getCenteredStartX(textWidth)
     return math.ceil((termWidth - textWidth) / 2) + 1
 end
 
--- 更新反应堆监控器的线程
+-- 更新反应堆监控器的协程
 local lastGrid = {}
 local gridRows = 6
 local gridCols = 9
@@ -186,13 +184,11 @@ for i = 1, gridRows do
     end
 end
 
-local function updateMonitor()
+local function updateMonitor_co()
     local cellWidth = 5
     local cellHeight = 2
     local startX = getCenteredStartX(45)
     local startY = 2
-
-    local statusText = ""
 
     while true do
         for i = 1, gridRows do
@@ -207,21 +203,11 @@ local function updateMonitor()
                     term.write(shortText)
                     term.setCursor(x, y + 1)
                     term.write(durabilityText)
-
                     lastGrid[i][j].shortText = shortText
                     lastGrid[i][j].durabilityText = durabilityText
                 end
             end
-            -- 每行更新后刷新状态栏
-            statusText = reactor.producesEnergy() and
-                string.format("反应堆状态：开启，输出：%5dEU/t", reactor.getReactorEUOutput()) or
-                "反应堆状态：关闭，输出：    0EU/t"
-            local heatBarText = getHeatBar()
-            term.setCursor(1, 15) -- 固定在第15行，避免与网格重叠
-            term.write(centerText(statusText, 45))
-            term.setCursor(1, 16)
-            term.write(centerText(heatBarText, 45))
-            os.sleep(0.005)
+            coroutine.yield()
         end
     end
 end
@@ -247,6 +233,7 @@ local function showGuide()
     end
 end
 
+-- 自动化设置页面控制函数
 local inputBuffer = "" -- 用于页面3的输入缓冲区
 local pointer = 1      -- 页面3的选项指针
 local function showAutoSettings()
@@ -265,8 +252,35 @@ local function showAutoSettings()
     end
 end
 
--- 更新页面标题的线程
-local function updatePage()
+-- 在监控页面更新状态栏
+local function updateStatus()
+    local statusText = reactor.producesEnergy() and
+        string.format("反应堆状态：开启，输出：%5dEU/t", math.floor(reactor.getReactorEUOutput())) or
+        "反应堆状态：关闭，输出：    0EU/t"
+    local heatBarText = getHeatBar()
+    term.setCursor(1, 15)
+    term.write(centerText(statusText, 45))
+    term.setCursor(1, 16)
+    term.write(centerText(heatBarText, 45))
+    if isCoolingDown then
+        term.setCursor(1, 14)
+        local elapsed = os.time() / 100 - shutdownStartTime
+        local remaining = math.max(0, cooldownDuration - elapsed)
+        local mins = math.floor(remaining / 60)
+        local secs = math.floor(remaining % 60)
+        local cooldownText = string.format("<--冷却中... 剩余时间：%02d分%02d秒-->", mins, secs)
+        term.write(centerText(cooldownText, 34))
+    elseif not restartFlag then
+        term.setCursor(1, 14)
+        term.write(centerText("注意：未开启自动重启功能。", 26))
+    else
+        term.setCursor(1, 14)
+        term.write(centerText("                            ", 30))
+    end
+end
+
+-- 更新页面标题的协程
+local function updatePage_co()
     local lastPage = 1
     term.setCursor(1, 1)
     term.write(centerText("<[A]  反应堆监视器  [D]>", 24))
@@ -277,50 +291,47 @@ local function updatePage()
             term.setCursor(1, 1)
             if currentPage == 1 then
                 term.write(centerText("<[A]  反应堆监视器  [D]>", 24))
-                if monitorThread and monitorThread:status() == "suspended" then
-                    monitorThread:resume()
-                end
+                monitor_active = true
             elseif currentPage == 2 then
                 term.write(centerText("<[A]  操作指南  [D]>", 20))
-                if monitorThread and monitorThread:status() == "running" then
-                    monitorThread:suspend()
-                    for i = 1, gridRows do
-                        lastGrid[i] = {}
-                        for j = 1, gridCols do
-                            lastGrid[i][j] = { shortText = "", durabilityText = "" }
-                        end
+                monitor_active = false
+                -- 重置网格
+                for i = 1, gridRows do
+                    lastGrid[i] = {}
+                    for j = 1, gridCols do
+                        lastGrid[i][j] = { shortText = "", durabilityText = "" }
                     end
                 end
                 showGuide()
             elseif currentPage == 3 then
                 term.write(centerText("<[A]  自动化  [D]>", 18))
-                if monitorThread and monitorThread:status() == "running" then
-                    monitorThread:suspend()
-                    for i = 1, gridRows do
-                        lastGrid[i] = {}
-                        for j = 1, gridCols do
-                            lastGrid[i][j] = { shortText = "", durabilityText = "" }
-                        end
+                monitor_active = false
+                -- 重置网格
+                for i = 1, gridRows do
+                    lastGrid[i] = {}
+                    for j = 1, gridCols do
+                        lastGrid[i][j] = { shortText = "", durabilityText = "" }
                     end
                 end
-
                 showAutoSettings()
             end
         else
-            -- 如果是页面3，动态更新显示（输入缓冲区变化）
+            if currentPage == 1 then
+                updateStatus()
+            end
             if currentPage == 3 then
                 showAutoSettings()
             end
         end
-        os.sleep(0.05)
+        coroutine.yield()
     end
 end
 
--- 监听键盘输入的线程
+-- 监听键盘输入的协程
 local maxLength = 6
-local function listenForKeyPress()
+local function listenForKeyPress_co()
     while true do
-        local _, _, char, code = event.pull("key_down")
+        local _, _, char, code = coroutine.yield()
         -- 分页切换（所有页面有效）
         if char == 97 then -- A
             if currentPage > 1 then
@@ -410,19 +421,67 @@ local function listenForKeyPress()
     end
 end
 
+--开场白
+local function showWelcome()
+    term.clear()
+    local welcomeLines = {
+        "================================",
+        "   欢迎使用简易核反应堆控制器   ",
+        "================================",
+        "",
+        "      ⚛核电，轻而易举呀！⚛       ",
+    }
+    for i, line in ipairs(welcomeLines) do
+        term.setCursor(1, i + 1)
+        term.write(centerText(line, 32))
+    end
+    os.sleep(3)
+end
+
+
 -- 主程序
 if findreactor() then
     if findredStone() then
-        term.clear()
+        showWelcome()
+        local input_co = coroutine.create(listenForKeyPress_co)
+        local page_co = coroutine.create(updatePage_co)
+        local auto_co = coroutine.create(autoControl_co)
+        local monitor_co = coroutine.create(updateMonitor_co)
 
-        local inputThread = thread.create(listenForKeyPress)
-        local pageThread = thread.create(updatePage)
-        local autoThread = thread.create(autoControl)
+        -- 初始启动协程（运行到第一个yield）
+        coroutine.resume(page_co)
+        coroutine.resume(auto_co)
+        coroutine.resume(monitor_co)
+        coroutine.resume(input_co) -- 立即yield，等待第一个按键事件
 
-        monitorThread = thread.create(updateMonitor)
+        local poll_cos = { page_co, auto_co }
 
-        -- 等待线程结束（实际上不会结束，除非程序被中断）
-        thread.waitForAll({ pageThread, monitorThread, inputThread, autoThread })
+        -- 主调度循环
+        while true do
+            -- 以短超时轮询键盘事件
+            local timeout = 0.005
+            local e = { event.pull(timeout, "key_down") }
+            if #e > 0 then
+                -- 事件到达：恢复输入协程并传递事件参数（忽略type和address）
+                coroutine.resume(input_co, nil, nil, e[3], e[4])
+            end
+
+            -- 恢复轮询协程
+            for _, co in ipairs(poll_cos) do
+                local stat = coroutine.status(co)
+                if stat == "suspended" then
+                    coroutine.resume(co)
+                end
+            end
+
+            -- 条件恢复监控协程
+            if monitor_active then
+                local stat = coroutine.status(monitor_co)
+                if stat == "suspended" then
+                    coroutine.resume(monitor_co)
+                end
+            end
+        end
     else
         print(centerText("红石I/O端口安装不当或存在其他红石输入", 37))
         os.sleep(5)
